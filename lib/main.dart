@@ -1,18 +1,23 @@
 import 'dart:async';
 import 'dart:developer'; // Untuk logging
+import 'dart:io'; // Untuk File
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart'; // Untuk rootBundle
 import 'package:thermal_print_dekstop/services/printer_storage_services.dart';
 import 'package:thermal_printer/esc_pos_utils_platform/esc_pos_utils_platform.dart';
 import 'package:thermal_printer/thermal_printer.dart';
 import 'package:image/image.dart' as img;
-import 'package:shared_preferences/shared_preferences.dart'; // Pastikan ini diimpor
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:path_provider/path_provider.dart'; // Import untuk debugging gambar
 
-import 'models/usb_printer_model.dart'; // Import model UsbPrinterModel yang sudah diperbaiki
+import 'models/usb_printer_model.dart';
+
+// GlobalKey untuk ScaffoldMessenger, memungkinkan akses SnackBar dari mana saja
+final GlobalKey<ScaffoldMessengerState> scaffoldMessengerKey =
+    GlobalKey<ScaffoldMessengerState>();
 
 void main() async {
   // Penting: Pastikan Flutter widgets terinisialisasi sebelum menjalankan runApp
-  // dan sebelum mengakses Shared Preferences.
   WidgetsFlutterBinding.ensureInitialized();
   runApp(const MyApp());
 }
@@ -25,7 +30,7 @@ class MyApp extends StatefulWidget {
 }
 
 class _MyAppState extends State<MyApp> {
-  // Tipe printer tetap USB karena fokus pada desktop (Windows)
+  // Fixed printer type for USB only (Windows)
   final PrinterType _printerType = PrinterType.usb;
   final PrinterManager _printerManager = PrinterManager.instance;
   final PrinterStorageService _printerStorageService = PrinterStorageService();
@@ -58,7 +63,8 @@ class _MyAppState extends State<MyApp> {
     // Muat daftar printer yang pernah terhubung dari penyimpanan
     _loadPreviouslyConnectedPrinters();
     // Otomatis mulai scan perangkat setelah sedikit delay
-    Future.delayed(const Duration(milliseconds: 500), () {
+    // Menggunakan Future.microtask untuk memastikan build sudah berjalan
+    Future.microtask(() {
       _scanDevices();
     });
   }
@@ -114,8 +120,8 @@ class _MyAppState extends State<MyApp> {
               _isConnected = false;
               _currentConnectedPrinter =
                   null; // Clear connected printer jika terputus
-              // _selectedPrinter juga bisa di-clear jika ingin pengguna memilih ulang
-              // _selectedPrinter = null;
+              _selectedPrinter =
+                  null; // Reset selected when disconnected for clarity
             }
           });
         },
@@ -180,9 +186,7 @@ class _MyAppState extends State<MyApp> {
             onError: (error) {
               log('Error during device discovery stream: $error');
               // Tampilkan pesan error tanpa menghentikan scan atau aplikasi
-              _showMessage(
-                'Error scanning devices: $error. Please check drivers.',
-              );
+              _showMessage('Error scanning devices: $error. Please try again.');
             },
             onDone: () {
               setState(() {
@@ -321,8 +325,7 @@ class _MyAppState extends State<MyApp> {
       setState(() {
         _isConnected = false;
         _currentConnectedPrinter = null; // Hapus printer yang sedang terhubung
-        // _selectedPrinter bisa tetap ada, atau di-clear tergantung UX yang diinginkan
-        // _selectedPrinter = null;
+        _selectedPrinter = null; // Clear selected on disconnect for UX
       });
       _showMessage('Disconnected successfully.');
       log('Disconnected from printer.');
@@ -363,14 +366,56 @@ class _MyAppState extends State<MyApp> {
         'CP1252',
       ); // Atau CP850, dll., tergantung printer
 
-      // Logo - Menggunakan imageRaster yang lebih baik untuk gambar kompleks pada printer thermal
+      // --- LOGO PRINTING SECTION ---
       try {
         final ByteData data = await rootBundle.load('assets/images/logo.jpg');
         final Uint8List imageBytes = data.buffer.asUint8List();
         final decodedImage = img.decodeImage(imageBytes);
 
-        if (decodedImage != null) {
-          int targetWidth = 384; // Lebar optimal untuk printer thermal 80mm
+        if (decodedImage == null) {
+          log(
+            'DEBUG: decodedImage is NULL for assets/images/logo.jpg. Check file integrity or format.',
+          );
+          _showMessage(
+            'Failed to decode logo image. Printing text header instead.',
+          );
+          bytes += generator.text(
+            '*** LOGO DECODE FAILED ***',
+            styles: const PosStyles(align: PosAlign.center),
+          );
+        } else {
+          log(
+            'DEBUG: Image decoded successfully. Width: ${decodedImage.width}, Height: ${decodedImage.height}',
+          );
+
+          // --- DEBUGGING: Simpan gambar yang diproses ke file ---
+          try {
+            // Menggunakan getApplicationSupportDirectory() yang lebih stabil untuk desktop
+            final directory = await getApplicationSupportDirectory();
+            final file = File('${directory.path}/dithered_logo.png');
+            await file.writeAsBytes(
+              img.encodePng(
+                img.ditherImage(
+                  img.luminanceThreshold(
+                    img.grayscale(img.copyResize(decodedImage, width: 384)),
+                    threshold: 128,
+                  ),
+                ),
+              ),
+            );
+            log('DEBUG: Saved dithered image to: ${file.path}');
+            _showMessage(
+              'Saved processed logo to ${file.path}',
+            ); // Info ke user
+          } catch (e) {
+            log('DEBUG: Failed to save dithered image for debugging: $e');
+            _showMessage(
+              'Failed to save processed logo for debug. Check permissions.',
+            );
+          }
+          // --- END DEBUGGING ---
+
+          int targetWidth = 384; // Optimal untuk printer thermal 80mm
           img.Image resizedImage = img.copyResize(
             decodedImage,
             width: targetWidth,
@@ -379,39 +424,28 @@ class _MyAppState extends State<MyApp> {
           img.Image grayscaleImage = img.grayscale(resizedImage);
           img.Image binaryImage = img.luminanceThreshold(
             grayscaleImage,
-            threshold: 128,
+            threshold:
+                128, // Anda bisa menyesuaikan nilai ini untuk hasil optimal
           );
-          img.Image ditheredImage = img.ditherImage(
-            binaryImage,
-          ); // Ini penting!
+          img.Image ditheredImage = img.ditherImage(binaryImage);
 
           // Gunakan imageRaster dengan metode bitImageRaster
           bytes += generator.imageRaster(
-            ditheredImage, // Mengirim gambar yang sudah di-dither
+            ditheredImage,
             align: PosAlign.center,
             imageFn:
                 PosImageFn
                     .bitImageRaster, // Metode terbaik untuk thermal printer
           );
-        } else {
-          log('Decoded image is null. Check if logo.jpg is valid.');
-          _showMessage(
-            'Failed to decode logo image. Printing text header instead.',
-          );
-          bytes += generator.text(
-            'MY STORE - IMAGE ERROR',
-            styles: const PosStyles(
-              align: PosAlign.center,
-              bold: true,
-              height: PosTextSize.size2,
-            ),
-          );
+
+          // Opsional: Jika bitImageRaster tidak berfungsi, Anda bisa mencoba generator.image()
+          // bytes += generator.image(ditheredImage);
         }
       } catch (e) {
         log('Error loading or processing logo image: $e');
         _showMessage('Error with logo: $e. Printing text header instead.');
         bytes += generator.text(
-          '* INEEDABEUTY *',
+          '* INEEDABEUTY - LOGO ERROR *',
           styles: const PosStyles(
             align: PosAlign.center,
             bold: true,
@@ -419,15 +453,25 @@ class _MyAppState extends State<MyApp> {
           ),
         );
       }
+      bytes += generator.emptyLines(
+        1,
+      ); // Tetap tambahkan baris kosong setelah logo/error
+      // --- END LOGO PRINTING SECTION ---
+
+      bytes += generator.text(
+        'TEST STRINGS:',
+        styles: const PosStyles(bold: true),
+      );
+      bytes += generator.text('ABCDEFGHIJKLMNOPQRSTUVWXYZ');
+      bytes += generator.text('1234567890');
       bytes += generator.emptyLines(1);
 
-      // Info Toko
       bytes += generator.text(
         'ineedabeuty',
         styles: const PosStyles(align: PosAlign.center, bold: true),
       );
       bytes += generator.text(
-        'Karangpawitan, Garut, Indonesia',
+        'Karangpawitan, Garut, Indonesia', // Lokasi saat ini
         styles: const PosStyles(align: PosAlign.center),
       );
       bytes += generator.text(
@@ -436,7 +480,6 @@ class _MyAppState extends State<MyApp> {
       );
       bytes += generator.emptyLines(1);
 
-      // Detail Transaksi
       bytes += generator.text(
         'Date: ${DateTime.now().toLocal().toString().split('.')[0]}',
         styles: const PosStyles(align: PosAlign.left),
@@ -446,7 +489,6 @@ class _MyAppState extends State<MyApp> {
       );
       bytes += generator.emptyLines(1);
 
-      // Garis Pemisah
       bytes += generator.text('================================');
       bytes += generator.text('ITEMS', styles: const PosStyles(bold: true));
       bytes += generator.text('================================');
@@ -585,10 +627,9 @@ class _MyAppState extends State<MyApp> {
       );
 
       // Potong kertas
-      bytes += generator.feed(3);
-      bytes += generator.cut();
+      bytes += generator.feed(3); // Majukan kertas 3 baris
+      bytes += generator.cut(); // Potong kertas
 
-      // Kirim ke printer
       log('Attempting to send print job...');
       await _printerManager.send(type: PrinterType.usb, bytes: bytes);
 
@@ -597,24 +638,32 @@ class _MyAppState extends State<MyApp> {
     } catch (e) {
       log('Error printing: $e');
       _showMessage('Print failed: $e');
-      // Simpan task print untuk dicoba kembali jika printer disconnected
-      _pendingPrintTask = bytes;
+      _pendingPrintTask =
+          bytes; // Simpan task print untuk dicoba kembali jika printer disconnected
       log('Print task saved for retry upon reconnection.');
     }
   }
 
-  // Menampilkan SnackBar message
+  // Fungsi untuk menampilkan SnackBar message
   void _showMessage(String message) {
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
+    // Menggunakan GlobalKey untuk memastikan akses ScaffoldMessenger yang stabil
+    Future.microtask(() {
+      scaffoldMessengerKey.currentState?.showSnackBar(
         SnackBar(content: Text(message), duration: const Duration(seconds: 3)),
       );
-    }
+      if (scaffoldMessengerKey.currentState == null) {
+        log(
+          'Warning: ScaffoldMessengerState is null. Could not show SnackBar: $message',
+        );
+      }
+    });
   }
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
+      // Mengaitkan GlobalKey dengan ScaffoldMessenger
+      scaffoldMessengerKey: scaffoldMessengerKey,
       title: 'USB Thermal Printer',
       theme: ThemeData(
         primarySwatch: Colors.blue,
@@ -821,9 +870,8 @@ class _MyAppState extends State<MyApp> {
                           _currentConnectedPrinter == device;
 
                       return GestureDetector(
-                        onTap: () => _selectDevice(device), // Tap untuk memilih
+                        onTap: () => _selectDevice(device),
                         onLongPress: () async {
-                          // Long press untuk menghapus dari daftar
                           bool? confirm = await showDialog<bool>(
                             context: context,
                             builder: (BuildContext context) {
@@ -855,7 +903,6 @@ class _MyAppState extends State<MyApp> {
                           );
 
                           if (confirm == true) {
-                            // Pastikan tidak menghapus printer yang sedang terhubung
                             if (isCurrentConnected) {
                               _showMessage(
                                 'Cannot remove a currently connected printer. Disconnect first.',
@@ -865,11 +912,10 @@ class _MyAppState extends State<MyApp> {
                             await _printerStorageService.removeConnectedPrinter(
                               device,
                             );
-                            await _loadPreviouslyConnectedPrinters(); // Refresh daftar
+                            await _loadPreviouslyConnectedPrinters();
                             if (_selectedPrinter == device) {
                               setState(() {
-                                _selectedPrinter =
-                                    null; // Clear selected if it was the removed one
+                                _selectedPrinter = null;
                               });
                             }
                             _showMessage(
@@ -904,6 +950,9 @@ class _MyAppState extends State<MyApp> {
                             ),
                             child: Column(
                               mainAxisAlignment: MainAxisAlignment.center,
+                              mainAxisSize:
+                                  MainAxisSize
+                                      .min, // Penting untuk mencegah overflow
                               children: [
                                 Icon(
                                   Icons.print,
@@ -975,13 +1024,15 @@ class _MyAppState extends State<MyApp> {
                       vertical: 5,
                     ),
                     decoration: BoxDecoration(
-                      color: Theme.of(context).primaryColor.withAlpha(40),
+                      color: Theme.of(
+                        context,
+                      ).primaryColor.withAlpha(40), // Menggunakan withAlpha
                       borderRadius: BorderRadius.circular(16),
                     ),
                     child: Text(
                       '${_availableDevices.length} found',
                       style: TextStyle(
-                        color: Theme.of(context).primaryColor.withAlpha(70),
+                        color: Theme.of(context).primaryColor.withAlpha(80),
                         fontSize: 13,
                         fontWeight: FontWeight.bold,
                       ),
@@ -993,51 +1044,58 @@ class _MyAppState extends State<MyApp> {
 
               // Daftar Printer Tersedia
               Expanded(
+                // Penting: Ini memastikan list mengambil sisa ruang
                 child:
                     _availableDevices.isEmpty && !_isScanning
                         ? Center(
-                          child: Column(
-                            mainAxisAlignment: MainAxisAlignment.center,
-                            children: [
-                              Icon(
-                                Icons.print_disabled,
-                                size: 80,
-                                color: Colors.grey[300],
-                              ),
-                              const SizedBox(height: 20),
-                              Text(
-                                'No USB printers found',
-                                style: TextStyle(
-                                  color: Colors.grey[500],
-                                  fontSize: 20,
-                                  fontWeight: FontWeight.w500,
+                          child: SingleChildScrollView(
+                            // Memungkinkan scroll jika konten terlalu besar
+                            child: Column(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              mainAxisSize:
+                                  MainAxisSize
+                                      .min, // Penting untuk mencegah overflow
+                              children: [
+                                Icon(
+                                  Icons.print_disabled,
+                                  size: 80,
+                                  color: Colors.grey[300],
                                 ),
-                              ),
-                              const SizedBox(height: 10),
-                              Text(
-                                'Make sure your thermal printer is:\n• Connected via USB\n• Powered on\n• Drivers installed',
-                                style: TextStyle(
-                                  color: Colors.grey[400],
-                                  fontSize: 15,
-                                ),
-                                textAlign: TextAlign.center,
-                              ),
-                              const SizedBox(height: 20),
-                              ElevatedButton.icon(
-                                onPressed: _scanDevices,
-                                icon: const Icon(Icons.refresh),
-                                label: const Text('Scan Again'),
-                                style: ElevatedButton.styleFrom(
-                                  padding: const EdgeInsets.symmetric(
-                                    horizontal: 20,
-                                    vertical: 12,
-                                  ),
-                                  shape: RoundedRectangleBorder(
-                                    borderRadius: BorderRadius.circular(8),
+                                const SizedBox(height: 20),
+                                Text(
+                                  'No USB printers found',
+                                  style: TextStyle(
+                                    color: Colors.grey[500],
+                                    fontSize: 20,
+                                    fontWeight: FontWeight.w500,
                                   ),
                                 ),
-                              ),
-                            ],
+                                const SizedBox(height: 10),
+                                Text(
+                                  'Make sure your thermal printer is:\n• Connected via USB\n• Powered on\n• Drivers installed',
+                                  style: TextStyle(
+                                    color: Colors.grey[400],
+                                    fontSize: 15,
+                                  ),
+                                  textAlign: TextAlign.center,
+                                ),
+                                const SizedBox(height: 20),
+                                ElevatedButton.icon(
+                                  onPressed: _scanDevices,
+                                  icon: const Icon(Icons.refresh),
+                                  label: const Text('Scan Again'),
+                                  style: ElevatedButton.styleFrom(
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 20,
+                                      vertical: 12,
+                                    ),
+                                    shape: RoundedRectangleBorder(
+                                      borderRadius: BorderRadius.circular(8),
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
                           ),
                         )
                         : ListView.builder(
@@ -1076,9 +1134,7 @@ class _MyAppState extends State<MyApp> {
                                         isCurrentConnected
                                             ? Colors.green.shade100
                                             : (isSelected
-                                                ? Theme.of(
-                                                  context,
-                                                ).primaryColor.withAlpha(10)
+                                                ? Theme.of(context).primaryColor
                                                 : Colors.grey.shade100),
                                     borderRadius: BorderRadius.circular(10),
                                   ),
@@ -1088,10 +1144,9 @@ class _MyAppState extends State<MyApp> {
                                         isCurrentConnected
                                             ? Colors.green.shade700
                                             : (isSelected
-                                                ? Theme.of(
-                                                  context,
-                                                ).primaryColor.withAlpha(70)
-                                                : Colors.grey.shade700),
+                                                ? Theme.of(context).primaryColor
+                                                : Colors
+                                                    .grey[700]), // Menggunakan primaryColor
                                     size: 28,
                                   ),
                                 ),
@@ -1106,15 +1161,16 @@ class _MyAppState extends State<MyApp> {
                                         isCurrentConnected
                                             ? Colors.green.shade700
                                             : (isSelected
-                                                ? Theme.of(
-                                                  context,
-                                                ).primaryColor.withAlpha(70)
-                                                : null),
+                                                ? Theme.of(context).primaryColor
+                                                : null), // Menggunakan primaryColor
                                     fontSize: 17,
                                   ),
                                 ),
                                 subtitle: Column(
                                   crossAxisAlignment: CrossAxisAlignment.start,
+                                  mainAxisSize:
+                                      MainAxisSize
+                                          .min, // Penting untuk mencegah overflow
                                   children: [
                                     const SizedBox(height: 6),
                                     Text('Vendor ID: ${device.vendorId}'),
@@ -1158,7 +1214,6 @@ class _MyAppState extends State<MyApp> {
 
               const SizedBox(height: 20),
 
-              // Tombol Print Test
               ElevatedButton.icon(
                 onPressed: _isConnected ? _printTestReceipt : null,
                 icon: const Icon(Icons.receipt_long, size: 24),
