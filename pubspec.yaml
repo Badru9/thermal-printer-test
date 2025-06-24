@@ -38,6 +38,7 @@ dependencies:
   thermal_printer: ^1.0.5
   shared_preferences: ^2.5.3
   path_provider: ^2.1.3
+  msix: ^3.16.9
 
 dev_dependencies:
   flutter_test:
@@ -52,6 +53,16 @@ dev_dependencies:
 
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec
+
+msix_config:
+  display_name: Thermal POS Printer Demo
+  publisher: ineedabeauty
+  publisher_display_name: ineedabeauty
+  identity_name: ineedabeauty.ThermalPOSPrinterDemo
+  msix_version: 1.0.0.0
+  logo_path: assets/images/logo.jpg
+  capabilities: 'usb'
+  output_name: ThermalPOSineedabeauty
 
 # The following section is specific to Flutter packages.
 flutter:
