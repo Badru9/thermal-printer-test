@@ -28,7 +28,6 @@ class _MyAppState extends State<MyApp> {
 
   StreamSubscription<PrinterDevice>? _subscription;
   StreamSubscription<USBStatus>? _subscriptionUsbStatus;
-  USBStatus _currentUsbStatus = USBStatus.none;
   List<int>? _pendingTask;
   UsbPrinter? _selectedPrinter;
 
@@ -53,27 +52,36 @@ class _MyAppState extends State<MyApp> {
     try {
       _subscriptionUsbStatus = _printerManager.stateUSB.listen((status) {
         log('USB Status: $status');
-        _currentUsbStatus = status;
 
         setState(() {
           if (status == USBStatus.connected) {
             _isConnected = true;
-          } else if (status == USBStatus.none ||
-              status != USBStatus.connected) {
+          } else if (status == USBStatus.none) {
             _isConnected = false;
           }
         });
 
-        // Execute pending task if available and connected
         if (status == USBStatus.connected && _pendingTask != null) {
-          Future.delayed(const Duration(milliseconds: 1000), () {
-            _printerManager.send(type: PrinterType.usb, bytes: _pendingTask!);
-            _pendingTask = null;
+          log('Executing pending print task...');
+          Future.delayed(const Duration(milliseconds: 1000), () async {
+            try {
+              await _printerManager.send(
+                type: PrinterType.usb,
+                bytes: _pendingTask!,
+              );
+              _pendingTask = null;
+              _showMessage('Pending print job sent successfully!');
+              log('Pending print job executed.');
+            } catch (e) {
+              _showMessage('Failed to send pending print job: $e');
+              log('Error sending pending print job: $e');
+            }
           });
         }
       });
     } catch (e) {
       log('Error initializing USB status listener: $e');
+      _showMessage('Error setting up USB listener: $e');
     }
   }
 
@@ -83,10 +91,14 @@ class _MyAppState extends State<MyApp> {
     setState(() {
       _isScanning = true;
       _devices.clear();
+      _selectedPrinter = null;
+      _isConnected = false;
     });
 
+    log('Starting USB device scan...');
+    log('Starting USB device scan... $_devices');
     try {
-      _subscription?.cancel(); // Cancel previous subscription
+      _subscription?.cancel();
 
       _subscription = _printerManager
           .discovery(type: _printerType, isBle: false)
@@ -102,7 +114,6 @@ class _MyAppState extends State<MyApp> {
                 productId: device.productId ?? '',
               );
 
-              // Avoid duplicates
               if (!_devices.any(
                 (d) =>
                     d.vendorId == usbPrinter.vendorId &&
@@ -123,16 +134,24 @@ class _MyAppState extends State<MyApp> {
               log(
                 'Device discovery completed. Found ${_devices.length} devices',
               );
+              if (_devices.isEmpty) {
+                _showMessage(
+                  'No USB printers found. Please check connection and drivers.',
+                );
+              }
             },
           );
 
-      // Stop scanning after 10 seconds
       Future.delayed(const Duration(seconds: 10), () {
         if (_isScanning) {
+          log('Scan timed out.');
           _subscription?.cancel();
           setState(() {
             _isScanning = false;
           });
+          if (_devices.isEmpty) {
+            _showMessage('Scan completed. No devices found within timeout.');
+          }
         }
       });
     } catch (e) {
@@ -145,15 +164,16 @@ class _MyAppState extends State<MyApp> {
   }
 
   void _selectDevice(UsbPrinter device) async {
-    // Disconnect previous device if different
     if (_selectedPrinter != null &&
         (_selectedPrinter!.vendorId != device.vendorId ||
             _selectedPrinter!.productId != device.productId)) {
+      log('Disconnecting from previously selected printer...');
       await _disconnectDevice();
     }
 
     _selectedPrinter = device;
     setState(() {});
+    _showMessage('Selected device: ${device.deviceName}');
     log('Selected device: ${device.deviceName}');
   }
 
@@ -163,12 +183,17 @@ class _MyAppState extends State<MyApp> {
       return;
     }
 
+    if (_isConnected) {
+      _showMessage('Already connected to a printer.');
+      return;
+    }
+
     setState(() {
       _isConnected = false;
     });
 
     try {
-      log('Connecting to: ${_selectedPrinter!.deviceName}');
+      log('Attempting to connect to: ${_selectedPrinter!.deviceName}');
 
       final success = await _printerManager.connect(
         type: PrinterType.usb,
@@ -183,15 +208,19 @@ class _MyAppState extends State<MyApp> {
         setState(() {
           _isConnected = true;
         });
-        _showMessage('Connected successfully');
-        log('Successfully connected to printer');
+        _showMessage(
+          'Connected successfully to ${_selectedPrinter!.deviceName}',
+        );
+        log(
+          'Successfully connected to printer: ${_selectedPrinter!.deviceName}',
+        );
       } else {
-        _showMessage('Failed to connect to printer');
-        log('Connection failed');
+        _showMessage('Failed to connect to printer.');
+        log('Connection failed: _printerManager.connect returned false.');
       }
     } catch (e) {
       log('Error connecting to printer: $e');
-      _showMessage('Connection error: $e');
+      _showMessage('Connection error: $e. Make sure drivers are installed.');
       setState(() {
         _isConnected = false;
       });
@@ -199,15 +228,24 @@ class _MyAppState extends State<MyApp> {
   }
 
   Future<void> _disconnectDevice() async {
-    if (_selectedPrinter == null) return;
+    if (_selectedPrinter == null) {
+      _showMessage('No printer selected to disconnect.');
+      return;
+    }
+    if (!_isConnected) {
+      _showMessage('Not currently connected.');
+      return;
+    }
 
     try {
+      log('Attempting to disconnect from printer...');
       await _printerManager.disconnect(type: PrinterType.usb);
       setState(() {
         _isConnected = false;
+        _selectedPrinter = null;
       });
-      _showMessage('Disconnected successfully');
-      log('Disconnected from printer');
+      _showMessage('Disconnected successfully.');
+      log('Disconnected from printer.');
     } catch (e) {
       log('Error disconnecting printer: $e');
       _showMessage('Disconnect error: $e');
@@ -228,38 +266,109 @@ class _MyAppState extends State<MyApp> {
     List<int> bytes = [];
 
     try {
-      // Load printer profile - fallback to default if specific profile not found
       CapabilityProfile profile;
       try {
-        profile = await CapabilityProfile.load(name: 'XP-N160I');
+        // Coba memuat profil 'POS-80' untuk printer 80mm
+        profile = await CapabilityProfile.load(name: 'POS-80');
+        log('Successfully loaded POS-80 profile.');
       } catch (e) {
-        log('Could not load XP-N160I profile, using default: $e');
+        log('Could not load POS-80 profile, trying Generic: $e');
+        // Fallback ke profil generik jika 'POS-80' tidak tersedia
         profile = await CapabilityProfile.load();
+        log('Using generic default profile.');
       }
 
-      final generator = Generator(PaperSize.mm58, profile);
+      // Pastikan PaperSize disetel ke mm80 untuk ZYWELL ZY-Q821
+      final generator = Generator(PaperSize.mm80, profile);
 
       // Set encoding
       bytes += generator.setGlobalCodeTable('CP1252');
 
-      // Header
+      // --- Perbaikan untuk masalah "string berorientasi ke bawah" ---
+      // Tambahkan teks sederhana di awal untuk menguji orientasi
       bytes += generator.text(
-        'TEST PRINT RECEIPT',
-        styles: const PosStyles(
-          align: PosAlign.center,
-          bold: true,
-          height: PosTextSize.size2,
-        ),
+        'TEST STRINGS:',
+        styles: const PosStyles(bold: true),
       );
+
+      bytes += generator.text('ABCDEFGHIJKLMNOPQRSTUVWXYZ');
+
+      bytes += generator.text('1234567890');
+      bytes += generator.emptyLines(1); // Tambahkan satu baris kosong
+
+      // Logo - Menggunakan imageRaster yang lebih baik untuk gambar kompleks pada printer thermal
+      try {
+        final ByteData data = await rootBundle.load('assets/images/logo.jpg');
+        final Uint8List imageBytes = data.buffer.asUint8List();
+        final decodedImage = img.decodeImage(imageBytes);
+
+        if (decodedImage != null) {
+          // Untuk printer 80mm, dots per baris tipikal adalah 576.
+          // Lebar target 384-400 piksel seringkali bagus untuk logo.
+          int targetWidth = 384; // Lebar optimal untuk printer thermal 80mm
+
+          // Resize image dengan mempertahankan aspect ratio
+          img.Image resizedImage = img.copyResize(
+            decodedImage,
+            width: targetWidth,
+            interpolation: img.Interpolation.linear,
+          );
+
+          // Konversi ke grayscale
+          img.Image grayscaleImage = img.grayscale(resizedImage);
+
+          // Terapkan threshold untuk memastikan gambar benar-benar biner (hitam/putih)
+          // Ini adalah langkah kunci untuk thermal printer
+          img.Image binaryImage = img.luminanceThreshold(
+            grayscaleImage,
+            threshold: 128,
+          ); // Threshold default 128
+
+          // Aplikasikan dithering untuk representasi nuansa yang lebih baik pada printer monokrom
+          // img.ditherImage() akan menggunakan algoritma dithering default.
+          img.Image ditheredImage = img.ditherImage(binaryImage);
+
+          // Gunakan imageRaster dengan metode bitImageRaster
+          bytes += generator.imageRaster(
+            ditheredImage,
+            align: PosAlign.center,
+            imageFn: PosImageFn.bitImageRaster,
+          );
+        } else {
+          log('Decoded image is null. Check if logo.jpg is valid.');
+          _showMessage(
+            'Failed to decode logo image. Printing text header instead.',
+          );
+          bytes += generator.text(
+            'MY STORE - IMAGE ERROR',
+            styles: const PosStyles(
+              align: PosAlign.center,
+              bold: true,
+              height: PosTextSize.size2,
+            ),
+          );
+        }
+      } catch (e) {
+        log('Error loading or processing logo image: $e');
+        _showMessage('Error with logo: $e. Printing text header instead.');
+        bytes += generator.text(
+          '* INEEDABEUTY *',
+          styles: const PosStyles(
+            align: PosAlign.center,
+            bold: true,
+            height: PosTextSize.size2,
+          ),
+        );
+      }
       bytes += generator.emptyLines(1);
 
-      // Store info
+      // Info Toko
       bytes += generator.text(
-        'My Store Windows',
+        'ineedabeuty',
         styles: const PosStyles(align: PosAlign.center, bold: true),
       );
       bytes += generator.text(
-        'Jakarta, Indonesia',
+        'Garut, Indonesia',
         styles: const PosStyles(align: PosAlign.center),
       );
       bytes += generator.text(
@@ -277,12 +386,12 @@ class _MyAppState extends State<MyApp> {
       );
       bytes += generator.emptyLines(1);
 
-      // Separator line
+      // Garis Pemisah
       bytes += generator.text('================================');
       bytes += generator.text('ITEMS', styles: const PosStyles(bold: true));
       bytes += generator.text('================================');
 
-      // Items with proper formatting
+      // Item dengan format yang tepat
       bytes += generator.row([
         PosColumn(
           width: 7,
@@ -337,37 +446,7 @@ class _MyAppState extends State<MyApp> {
         ),
       ]);
 
-      // Print logo if available
-      try {
-        final ByteData data = await rootBundle.load('assets/ic_launcher.png');
-        if (data.lengthInBytes > 0) {
-          final Uint8List imageBytes = data.buffer.asUint8List();
-          final decodedImage = img.decodeImage(imageBytes);
-
-          if (decodedImage != null) {
-            // Resize image to fit thermal printer width
-            img.Image resizedImage = img.copyResize(
-              decodedImage,
-              width: 200, // Suitable for 58mm thermal printer
-            );
-
-            // Convert to grayscale for better printing
-            img.Image grayscaleImage = img.grayscale(resizedImage);
-
-            bytes += generator.emptyLines(1);
-            bytes += generator.imageRaster(
-              grayscaleImage,
-              align: PosAlign.center,
-            );
-            bytes += generator.emptyLines(1);
-          }
-        }
-      } catch (e) {
-        log('Could not load image: $e');
-        // Continue without image
-      }
-
-      // Total section
+      // Bagian Total
       bytes += generator.text('================================');
       bytes += generator.row([
         PosColumn(
@@ -419,7 +498,7 @@ class _MyAppState extends State<MyApp> {
 
       bytes += generator.text('================================');
 
-      // Payment info
+      // Info Pembayaran
       bytes += generator.emptyLines(1);
       bytes += generator.text('PAYMENT: CASH');
       bytes += generator.text('PAID: 100.000');
@@ -445,11 +524,12 @@ class _MyAppState extends State<MyApp> {
         ),
       );
 
-      // Cut paper
+      // Potong kertas
       bytes += generator.feed(3);
       bytes += generator.cut();
 
-      // Send to printer
+      // Kirim ke printer
+      log('Attempting to send print job...');
       await _printerManager.send(type: PrinterType.usb, bytes: bytes);
 
       _showMessage('Print job sent successfully!');
